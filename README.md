@@ -1,10 +1,10 @@
-# dimos-module-fastlio2
+# dimos-module-pointlio
 
-FAST-LIO2 (non-ROS) source for the DimOS native module. This repo is consumed as a source input by the fastlio2 flake in the main dimos repo — it is not built standalone.
+Point-LIO (non-ROS) source for the DimOS native module. This repo is consumed as a source input by the pointlio flake in the main dimos repo — it is not built standalone.
 
 ## Upstream
 
-Based on [hku-mars/FAST_LIO](https://github.com/hku-mars/FAST_LIO) via the [non-ROS fork](https://github.com/BurhanMuhyiddin/FAST-LIO-NON-ROS) by BurhanMuhyiddin.
+Non-ROS port of [hku-mars/Point-LIO](https://github.com/hku-mars/Point-LIO). The non-ROS harness is derived from the DimOS FAST-LIO2 non-ROS work (dimos-module-fastlio2).
 
 DimOS modifications:
 - Parameterized config via CLI arguments (no hardcoded paths)
@@ -15,4 +15,4 @@ DimOS modifications:
 
 ## License
 
-GPL-2.0 — inherited from upstream [FAST_LIO](https://github.com/hku-mars/FAST_LIO).
+GPL-2.0 — inherited from upstream [Point-LIO](https://github.com/hku-mars/Point-LIO).
