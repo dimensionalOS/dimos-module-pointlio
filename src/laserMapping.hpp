@@ -1035,8 +1035,14 @@ PointCloudXYZI::Ptr LaserMapping::get_world_cloud() const {
 }
 PointCloudXYZI::Ptr LaserMapping::get_body_cloud() const {
     if (!feats_undistort || feats_undistort->empty()) return nullptr;
-    // Undistorted points in the LiDAR/sensor frame — no world registration.
-    return PointCloudXYZI::Ptr(new PointCloudXYZI(*feats_undistort));
+    // Undistorted points in the IMU/body frame (vanilla cloud_registered_body
+    // convention): LiDAR->IMU extrinsic applied, no world registration.
+    int n = feats_undistort->points.size();
+    PointCloudXYZI::Ptr cloud(new PointCloudXYZI(n, 1));
+    for (int i = 0; i < n; i++) {
+        pointBodyLidarToIMU(&feats_undistort->points[i], &cloud->points[i]);
+    }
+    return cloud;
 }
 std::vector<double> LaserMapping::get_world_quat() const {
     Eigen::Quaterniond q(kf_output.x_.rot);
