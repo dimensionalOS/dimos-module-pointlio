@@ -1,5 +1,5 @@
 {
-  description = "FAST-LIO (non-ROS) dev environment";
+  description = "pointlio-core (Rust Point-LIO) dev environment";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -13,23 +13,17 @@
       in {
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [
-            cmake
-            pkg-config
-            eigen
-            pcl
-            yaml-cpp
-            glog
-            boost
-            nlohmann_json
-            python3
-            python3Packages.matplotlib
-            python3Packages.numpy
-            llvmPackages.openmp
+            cargo
+            rustc
+            rustfmt
+            clippy
+            rust-analyzer
           ];
 
           shellHook = ''
-            echo "FAST-LIO-NON-ROS dev shell ready"
-            echo "Build: mkdir -p build && cd build && cmake .. && make"
+            echo "pointlio-core dev shell ready"
+            echo "Build: cd rust && cargo build"
+            echo "Test:  cd rust && cargo test"
           '';
         };
       });
