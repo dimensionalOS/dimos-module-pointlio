@@ -21,7 +21,7 @@
 
 use std::collections::VecDeque;
 
-use nalgebra::SMatrix;
+use nalgebra::{Rotation3, SMatrix, UnitQuaternion};
 
 use crate::common::{time_compressing, ImuSample, MeasureGroup, PointXYZI};
 use crate::estimator::{
@@ -110,6 +110,51 @@ pub struct Odom {
     pub omg: [f64; 3],
 }
 
+/// The filter state after one time group of the point-by-point update.
+#[derive(Clone, Copy, Debug)]
+struct ScanPose {
+    t: f64,
+    pos: V3,
+    rot: UnitQuaternion<f64>,
+}
+
+impl ScanPose {
+    fn new(t: f64, pose: Pose) -> Self {
+        let rot =
+            UnitQuaternion::from_rotation_matrix(&Rotation3::from_matrix_unchecked(*pose.rot));
+        Self {
+            t,
+            pos: *pose.pos,
+            rot,
+        }
+    }
+}
+
+/// Pose at `t`, interpolated between the neighboring samples and clamped at either end.
+fn pose_at(poses: &[ScanPose], t: f64) -> (V3, UnitQuaternion<f64>) {
+    let i = poses.partition_point(|p| p.t < t);
+    if i == 0 {
+        return (poses[0].pos, poses[0].rot);
+    }
+    let a = &poses[i - 1];
+    if i == poses.len() {
+        return (a.pos, a.rot);
+    }
+    let b = &poses[i];
+    let alpha = (t - a.t) / (b.t - a.t);
+    (a.pos.lerp(&b.pos, alpha), a.rot.nlerp(&b.rot, alpha))
+}
+
+fn point_out(v: V3, intensity: f32) -> PointXYZI {
+    PointXYZI {
+        x: v[0] as f32,
+        y: v[1] as f32,
+        z: v[2] as f32,
+        intensity,
+        curvature: 0.0,
+    }
+}
+
 pub struct LaserMapping {
     cfg: Config,
     pre: Preprocess,
@@ -160,6 +205,7 @@ pub struct LaserMapping {
     crossmat_list: Vec<M3>,
     pub effct_feat_num: i32,
     pub feats_down_size: usize,
+    scan_poses: Vec<ScanPose>,
     angvel_avr: V3,
     acc_avr: V3,
     input_in: InputIkfom,
@@ -265,6 +311,7 @@ impl LaserMapping {
             crossmat_list: Vec::new(),
             effct_feat_num: 0,
             feats_down_size: 0,
+            scan_poses: Vec::new(),
             angvel_avr: V3::zeros(),
             acc_avr: V3::zeros(),
             input_in: InputIkfom::default(),
@@ -585,6 +632,7 @@ impl LaserMapping {
             pbody_list,
             crossmat_list,
             effct_feat_num,
+            scan_poses,
             angvel_avr,
             acc_avr,
             input_in,
@@ -592,6 +640,7 @@ impl LaserMapping {
             ..
         } = self;
         *effct_feat_num = 0;
+        scan_poses.clear();
         let pcl_beg_time = measures.lidar_beg_time;
         let mut idx: isize = -1;
         let mut ctx = HModelCtx {
@@ -713,31 +762,28 @@ impl LaserMapping {
                 }
                 kf_output.predict(dt, q_output, input_in, true, false);
                 *time_predict_last_const = *time_current;
-                if n < 1 {
-                    idx += ctx.time_seq[k] as isize;
-                    continue;
-                }
-                ctx.k = k;
-                ctx.idx = idx;
-                let ok = kf_output.update_iterated_dyn_share_modified(|s, cp, cr, d| {
-                    h_model_output(s, cp, cr, &mut ctx, d)
-                });
-                if !ok {
-                    idx += ctx.time_seq[k] as isize;
-                    continue;
-                }
-                if cfg.prop_at_freq_of_imu {
-                    let dt_cov = *time_current - *time_update_last;
-                    if !cfg.imu_en && dt_cov >= cfg.imu_time_inte {
-                        kf_output.predict(dt_cov, q_output, input_in, false, true);
-                        *time_update_last = *time_current;
-                    }
-                }
-                if cfg.publish_odometry_without_downsample {
-                    publish(odom, kf_input, kf_output, *time_current, imu_last);
-                }
                 let len = ctx.time_seq[k];
-                to_world(&mut ctx, Pose::from(&kf_output.x), idx, len);
+                let ok = n >= 1 && {
+                    ctx.k = k;
+                    ctx.idx = idx;
+                    kf_output.update_iterated_dyn_share_modified(|s, cp, cr, d| {
+                        h_model_output(s, cp, cr, &mut ctx, d)
+                    })
+                };
+                if ok {
+                    if cfg.prop_at_freq_of_imu {
+                        let dt_cov = *time_current - *time_update_last;
+                        if !cfg.imu_en && dt_cov >= cfg.imu_time_inte {
+                            kf_output.predict(dt_cov, q_output, input_in, false, true);
+                            *time_update_last = *time_current;
+                        }
+                    }
+                    if cfg.publish_odometry_without_downsample {
+                        publish(odom, kf_input, kf_output, *time_current, imu_last);
+                    }
+                    to_world(&mut ctx, Pose::from(&kf_output.x), idx, len);
+                }
+                scan_poses.push(ScanPose::new(*time_current, Pose::from(&kf_output.x)));
                 idx += len as isize;
             }
         } else {
@@ -779,24 +825,21 @@ impl LaserMapping {
                     }
                 }
                 kf_input.predict(dt, q_input, input_in, true, false);
-                if n < 1 {
-                    idx += ctx.time_seq[k] as isize;
-                    continue;
-                }
-                ctx.k = k;
-                ctx.idx = idx;
-                let ok = kf_input.update_iterated_dyn_share_modified(|s, cp, cr, d| {
-                    h_model_input(s, cp, cr, &mut ctx, d)
-                });
-                if !ok {
-                    idx += ctx.time_seq[k] as isize;
-                    continue;
-                }
-                if cfg.publish_odometry_without_downsample {
-                    publish(odom, kf_input, kf_output, *time_current, imu_last);
-                }
                 let len = ctx.time_seq[k];
-                to_world(&mut ctx, Pose::from(&kf_input.x), idx, len);
+                let ok = n >= 1 && {
+                    ctx.k = k;
+                    ctx.idx = idx;
+                    kf_input.update_iterated_dyn_share_modified(|s, cp, cr, d| {
+                        h_model_input(s, cp, cr, &mut ctx, d)
+                    })
+                };
+                if ok {
+                    if cfg.publish_odometry_without_downsample {
+                        publish(odom, kf_input, kf_output, *time_current, imu_last);
+                    }
+                    to_world(&mut ctx, Pose::from(&kf_input.x), idx, len);
+                }
+                scan_poses.push(ScanPose::new(*time_current, Pose::from(&kf_input.x)));
                 idx += len as isize;
             }
         }
@@ -809,51 +852,54 @@ impl LaserMapping {
         self.odom
     }
 
-    /// `get_body_cloud`: the undistorted scan in the IMU frame.
-    pub fn body_cloud(&self) -> Vec<PointXYZI> {
-        let (r, t) = if self.cfg.extrinsic_est_en {
-            let (_, _, orli, otli) = if !self.cfg.use_imu_as_input {
-                let x = &self.kf_output.x;
-                (x.pos, x.rot, x.offset_R_L_I, x.offset_T_L_I)
-            } else {
-                let x = &self.kf_input.x;
-                (x.pos, x.rot, x.offset_R_L_I, x.offset_T_L_I)
-            };
-            (frob_normalized(&orli), otli)
+    /// Lidar to IMU extrinsic, from the state when it is estimated.
+    fn extrinsic(&self) -> (M3, V3) {
+        if !self.cfg.extrinsic_est_en {
+            return (self.lidar_r_wrt_imu, self.lidar_t_wrt_imu);
+        }
+        let (orli, otli) = if !self.cfg.use_imu_as_input {
+            let x = &self.kf_output.x;
+            (x.offset_R_L_I, x.offset_T_L_I)
         } else {
-            (self.lidar_r_wrt_imu, self.lidar_t_wrt_imu)
+            let x = &self.kf_input.x;
+            (x.offset_R_L_I, x.offset_T_L_I)
         };
-        self.feats_undistort
-            .iter()
-            .map(|p| {
-                let b = r * V3::new(p.x as f64, p.y as f64, p.z as f64) + t;
-                PointXYZI {
-                    x: b[0] as f32,
-                    y: b[1] as f32,
-                    z: b[2] as f32,
-                    intensity: p.intensity,
-                    curvature: 0.0,
-                }
-            })
+        (frob_normalized(&orli), otli)
+    }
+
+    /// Every point of the last scan in the world frame, moved by the state at its own time.
+    /// Empty until a scan has been through the point-by-point update.
+    fn deskewed_world(&self) -> impl Iterator<Item = (V3, f32)> + '_ {
+        let (r, t) = self.extrinsic();
+        let beg = self.measures.lidar_beg_time;
+        let points: &[PointXYZI] = if self.scan_poses.is_empty() {
+            &[]
+        } else {
+            &self.feats_undistort
+        };
+        points.iter().map(move |p| {
+            let (pos, rot) = pose_at(&self.scan_poses, beg + p.curvature as f64 / 1000.0);
+            let w = rot * (r * V3::new(p.x as f64, p.y as f64, p.z as f64) + t) + pos;
+            (w, p.intensity)
+        })
+    }
+
+    /// `get_body_cloud`, deskewed: the last scan in the IMU frame at the end of the scan,
+    /// the pose `odometry()` reports.
+    pub fn body_cloud(&self) -> Vec<PointXYZI> {
+        let Some(end) = self.scan_poses.last() else {
+            return Vec::new();
+        };
+        let rot_inv = end.rot.inverse();
+        self.deskewed_world()
+            .map(|(w, i)| point_out(rot_inv * (w - end.pos), i))
             .collect()
     }
 
-    /// `get_world_cloud`: the undistorted scan registered with `kf_output` (whatever the mode).
+    /// `get_world_cloud`, deskewed: the last scan in the world frame.
     pub fn world_cloud(&self) -> Vec<PointXYZI> {
-        let x = &self.kf_output.x;
-        self.feats_undistort
-            .iter()
-            .map(|p| {
-                let pb = V3::new(p.x as f64, p.y as f64, p.z as f64);
-                let w = x.rot * (x.offset_R_L_I * pb + x.offset_T_L_I) + x.pos;
-                PointXYZI {
-                    x: w[0] as f32,
-                    y: w[1] as f32,
-                    z: w[2] as f32,
-                    intensity: p.intensity,
-                    curvature: 0.0,
-                }
-            })
+        self.deskewed_world()
+            .map(|(w, i)| point_out(w, i))
             .collect()
     }
 }
@@ -961,5 +1007,104 @@ mod tests {
         assert!(processed >= 5, "processed {processed}");
         assert_eq!(lm.body_cloud().len(), lm.world_cloud().len());
         assert!(lm.ivox.num_valid_grids() > 10);
+        // The trajectory spans the scan, and a resting sensor sees no deskew beyond the
+        // filter's own jitter.
+        let poses = &lm.scan_poses;
+        assert!(poses.len() > 100, "{}", poses.len());
+        assert!(poses.windows(2).all(|w| w[1].t > w[0].t));
+        assert!(
+            poses[0].t < lm.lidar_end_time - 0.09 && poses.last().unwrap().t <= lm.lidar_end_time
+        );
+        let (r, t) = lm.extrinsic();
+        for (raw, out) in lm.feats_undistort.iter().zip(lm.body_cloud()) {
+            let b = r * V3::new(raw.x as f64, raw.y as f64, raw.z as f64) + t;
+            let d = (V3::new(out.x as f64, out.y as f64, out.z as f64) - b).norm();
+            assert!(d < 0.02, "{d}");
+        }
+    }
+
+    #[test]
+    fn deskew_moves_each_point_by_the_pose_at_its_time() {
+        // A wall at world x = 5 scanned over 100 ms while the sensor yaws at 1.4 rad/s and
+        // walks at 1 m/s. Raw points are what the lidar saw at each point's time, so the
+        // deskewed body cloud must be the wall seen from the scan-end pose, coplanar, and the
+        // world cloud must lie on the wall itself.
+        let cfg = Config {
+            extrinsic_t: vec![0.1, 0.02, -0.05],
+            extrinsic_r: vec![0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
+            ..Default::default()
+        };
+        let mut lm = LaserMapping::new(&cfg);
+        let beg = 100.0;
+        lm.measures.lidar_beg_time = beg;
+        let pose_at_time = |t: f64| {
+            let dt = t - beg;
+            (
+                V3::new(dt, 0.3 * dt, 0.0),
+                crate::so3::exp(&V3::new(0.0, 0.0, 1.4 * dt)),
+            )
+        };
+        // Samples every 0.5 ms, as the downsampled groups would give.
+        for i in 0..=200 {
+            let t = beg + i as f64 * 0.0005;
+            let (pos, rot) = pose_at_time(t);
+            let pose = Pose {
+                pos: &pos,
+                rot: &rot,
+                offset_R_L_I: &lm.lidar_r_wrt_imu,
+                offset_T_L_I: &lm.lidar_t_wrt_imu,
+            };
+            lm.scan_poses.push(ScanPose::new(t, pose));
+        }
+        lm.lidar_end_time = beg + 0.1;
+        let mut wall = Vec::new();
+        for i in 0..2000 {
+            // Point times fall between samples, so interpolation is exercised.
+            let offset_ms = i as f64 * 0.05 + 0.00013;
+            let t = beg + offset_ms / 1000.0;
+            let w = V3::new(5.0, (i % 50) as f64 * 0.1 - 2.5, (i % 7) as f64 * 0.3 - 0.9);
+            let (pos, rot) = pose_at_time(t);
+            let b = rot.transpose() * (w - pos);
+            let l = lm.lidar_r_wrt_imu.transpose() * (b - lm.lidar_t_wrt_imu);
+            wall.push(w);
+            lm.feats_undistort.push(PointXYZI {
+                x: l[0] as f32,
+                y: l[1] as f32,
+                z: l[2] as f32,
+                intensity: 1.0,
+                curvature: offset_ms as f32,
+            });
+        }
+        let world = lm.world_cloud();
+        assert_eq!(world.len(), wall.len());
+        for (p, w) in world.iter().zip(&wall) {
+            let d = (V3::new(p.x as f64, p.y as f64, p.z as f64) - w).norm();
+            assert!(d < 1e-3, "{d}");
+        }
+        let end = lm.scan_poses.last().unwrap();
+        let body = lm.body_cloud();
+        for (p, w) in body.iter().zip(&wall) {
+            let expect = end.rot.inverse() * (w - end.pos);
+            let d = (V3::new(p.x as f64, p.y as f64, p.z as f64) - expect).norm();
+            assert!(d < 1e-3, "{d}");
+        }
+        // Coplanar in the end frame: the wall normal is world x rotated into that frame.
+        let n = end.rot.inverse() * V3::x();
+        let offset = n.dot(&(end.rot.inverse() * (V3::new(5.0, 0.0, 0.0) - end.pos)));
+        for p in &body {
+            let d = n.dot(&V3::new(p.x as f64, p.y as f64, p.z as f64)) - offset;
+            assert!(d.abs() < 1e-3, "{d}");
+        }
+        // Without deskew the same raw scan is far off the wall.
+        let (r, t) = lm.extrinsic();
+        let worst = lm
+            .feats_undistort
+            .iter()
+            .map(|p| {
+                let b = r * V3::new(p.x as f64, p.y as f64, p.z as f64) + t;
+                (n.dot(&b) - offset).abs()
+            })
+            .fold(0.0, f64::max);
+        assert!(worst > 0.3, "{worst}");
     }
 }

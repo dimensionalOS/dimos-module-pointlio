@@ -218,12 +218,12 @@ impl PointLio {
         self.lm.odometry()
     }
 
-    /// Undistorted scan in the IMU frame.
+    /// Deskewed scan in the IMU frame at the end of the scan, the pose `odometry()` reports.
     pub fn body_cloud(&self) -> Vec<PointXYZI> {
         self.lm.body_cloud()
     }
 
-    /// Undistorted scan in the world frame.
+    /// Deskewed scan in the world frame.
     pub fn world_cloud(&self) -> Vec<PointXYZI> {
         self.lm.world_cloud()
     }
