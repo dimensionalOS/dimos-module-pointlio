@@ -17,7 +17,8 @@
 //! Port of `laserMapping.hpp`: input buffering, lidar/IMU sync, the per-frame point-by-point
 //! IESKF loop (both `use_imu_as_input` branches), map init/increment, odometry. The C++ globals
 //! are fields of `LaserMapping`; plots, log files, ROS publishing, PCD saving and the dead
-//! ikd-Tree FOV code are not ported.
+//! ikd-Tree FOV code are not ported. Unlike the C++ getters, `body_cloud` and `world_cloud`
+//! deskew the scan with the per-point states of the update.
 
 use std::collections::VecDeque;
 
@@ -112,7 +113,6 @@ pub struct Odom {
 
 /// The filter state after one time group of the point-by-point update, `t` seconds after
 /// the scan began.
-#[derive(Clone, Copy, Debug)]
 struct ScanPose {
     t: f64,
     pos: V3,
@@ -139,7 +139,7 @@ impl ScanTrajectory {
         self.poses.last()
     }
 
-    /// Record the state at `t`, with the quaternion sign kept continuous so that
+    /// Record the state at `t`. The quaternion sign follows the previous sample, so
     /// interpolation between neighbors takes the short arc.
     fn push(&mut self, t: f64, pose: Pose) {
         let mut rot =
@@ -881,8 +881,7 @@ impl LaserMapping {
         self.odom
     }
 
-    /// Lidar to IMU extrinsic: the configured one, or the state's when it is estimated, as
-    /// `point_body_to_world` registers points into the map.
+    /// Lidar to IMU extrinsic: the configured one, or the state's when it is estimated.
     fn extrinsic(&self) -> (M3, V3) {
         if !self.cfg.extrinsic_est_en {
             return (self.lidar_r_wrt_imu, self.lidar_t_wrt_imu);
@@ -1015,12 +1014,7 @@ mod tests {
         let mut processed = false;
         loop {
             let before = lm.lidar_buffer.len();
-            if lm.run_once() {
-                processed = true;
-                let o = lm.odometry();
-                assert!(o.pos.iter().all(|v| v.abs() < 0.05), "{o:?}");
-                assert!((o.quat[3].abs() - 1.0).abs() < 1e-3, "{o:?}");
-            }
+            processed |= lm.run_once();
             if lm.lidar_buffer.len() == before {
                 break;
             }
@@ -1035,6 +1029,9 @@ mod tests {
         for f in 0..10u64 {
             if feed_resting_frame(&mut lm, &frame, 100.0 + f as f64 * 0.1) {
                 processed += 1;
+                let o = lm.odometry();
+                assert!(o.pos.iter().all(|v| v.abs() < 0.05), "{o:?}");
+                assert!((o.quat[3].abs() - 1.0).abs() < 1e-3, "{o:?}");
             }
         }
         assert!(processed >= 5, "processed {processed}");
