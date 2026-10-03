@@ -110,7 +110,8 @@ pub struct Odom {
     pub omg: [f64; 3],
 }
 
-/// The filter state after one time group of the point-by-point update.
+/// The filter state after one time group of the point-by-point update, `t` seconds after
+/// the scan began.
 #[derive(Clone, Copy, Debug)]
 struct ScanPose {
     t: f64,
@@ -118,34 +119,61 @@ struct ScanPose {
     rot: UnitQuaternion<f64>,
 }
 
-impl ScanPose {
-    fn new(t: f64, pose: Pose) -> Self {
-        let rot =
+/// The filter's path through the last scan, one sample per time group. Belongs to the
+/// same scan as `feats_undistort` and is cleared with it.
+#[derive(Default)]
+struct ScanTrajectory {
+    poses: Vec<ScanPose>,
+}
+
+impl ScanTrajectory {
+    fn clear(&mut self) {
+        self.poses.clear();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.poses.is_empty()
+    }
+
+    fn end(&self) -> Option<&ScanPose> {
+        self.poses.last()
+    }
+
+    /// Record the state at `t`, with the quaternion sign kept continuous so that
+    /// interpolation between neighbors takes the short arc.
+    fn push(&mut self, t: f64, pose: Pose) {
+        let mut rot =
             UnitQuaternion::from_rotation_matrix(&Rotation3::from_matrix_unchecked(*pose.rot));
-        Self {
+        if let Some(prev) = self.poses.last() {
+            if prev.rot.coords.dot(&rot.coords) < 0.0 {
+                rot = UnitQuaternion::new_unchecked(-rot.into_inner());
+            }
+        }
+        self.poses.push(ScanPose {
             t,
             pos: *pose.pos,
             rot,
+        });
+    }
+
+    /// Pose at `t`, interpolated between the neighboring samples and clamped at either end.
+    fn pose_at(&self, t: f64) -> (V3, UnitQuaternion<f64>) {
+        let poses = &self.poses;
+        let i = poses.partition_point(|p| p.t < t);
+        if i == 0 {
+            return (poses[0].pos, poses[0].rot);
         }
+        let a = &poses[i - 1];
+        if i == poses.len() {
+            return (a.pos, a.rot);
+        }
+        let b = &poses[i];
+        let alpha = (t - a.t) / (b.t - a.t);
+        (a.pos.lerp(&b.pos, alpha), a.rot.nlerp(&b.rot, alpha))
     }
 }
 
-/// Pose at `t`, interpolated between the neighboring samples and clamped at either end.
-fn pose_at(poses: &[ScanPose], t: f64) -> (V3, UnitQuaternion<f64>) {
-    let i = poses.partition_point(|p| p.t < t);
-    if i == 0 {
-        return (poses[0].pos, poses[0].rot);
-    }
-    let a = &poses[i - 1];
-    if i == poses.len() {
-        return (a.pos, a.rot);
-    }
-    let b = &poses[i];
-    let alpha = (t - a.t) / (b.t - a.t);
-    (a.pos.lerp(&b.pos, alpha), a.rot.nlerp(&b.rot, alpha))
-}
-
-fn point_out(v: V3, intensity: f32) -> PointXYZI {
+fn to_point(v: V3, intensity: f32) -> PointXYZI {
     PointXYZI {
         x: v[0] as f32,
         y: v[1] as f32,
@@ -205,7 +233,7 @@ pub struct LaserMapping {
     crossmat_list: Vec<M3>,
     pub effct_feat_num: i32,
     pub feats_down_size: usize,
-    scan_poses: Vec<ScanPose>,
+    trajectory: ScanTrajectory,
     angvel_avr: V3,
     acc_avr: V3,
     input_in: InputIkfom,
@@ -311,7 +339,7 @@ impl LaserMapping {
             crossmat_list: Vec::new(),
             effct_feat_num: 0,
             feats_down_size: 0,
-            scan_poses: Vec::new(),
+            trajectory: ScanTrajectory::default(),
             angvel_avr: V3::zeros(),
             acc_avr: V3::zeros(),
             input_in: InputIkfom::default(),
@@ -470,6 +498,7 @@ impl LaserMapping {
         }
         if self.p_imu.process(self.measures.imu.make_contiguous()) {
             self.feats_undistort = self.measures.lidar.clone();
+            self.trajectory.clear();
         }
         if self.feats_undistort.is_empty() {
             return false;
@@ -632,7 +661,7 @@ impl LaserMapping {
             pbody_list,
             crossmat_list,
             effct_feat_num,
-            scan_poses,
+            trajectory,
             angvel_avr,
             acc_avr,
             input_in,
@@ -640,7 +669,7 @@ impl LaserMapping {
             ..
         } = self;
         *effct_feat_num = 0;
-        scan_poses.clear();
+        trajectory.clear();
         let pcl_beg_time = measures.lidar_beg_time;
         let mut idx: isize = -1;
         let mut ctx = HModelCtx {
@@ -783,7 +812,7 @@ impl LaserMapping {
                     }
                     to_world(&mut ctx, Pose::from(&kf_output.x), idx, len);
                 }
-                scan_poses.push(ScanPose::new(*time_current, Pose::from(&kf_output.x)));
+                trajectory.push(*time_current - pcl_beg_time, Pose::from(&kf_output.x));
                 idx += len as isize;
             }
         } else {
@@ -839,7 +868,7 @@ impl LaserMapping {
                     }
                     to_world(&mut ctx, Pose::from(&kf_input.x), idx, len);
                 }
-                scan_poses.push(ScanPose::new(*time_current, Pose::from(&kf_input.x)));
+                trajectory.push(*time_current - pcl_beg_time, Pose::from(&kf_input.x));
                 idx += len as isize;
             }
         }
@@ -852,33 +881,32 @@ impl LaserMapping {
         self.odom
     }
 
-    /// Lidar to IMU extrinsic, from the state when it is estimated.
+    /// Lidar to IMU extrinsic: the configured one, or the state's when it is estimated, as
+    /// `point_body_to_world` registers points into the map.
     fn extrinsic(&self) -> (M3, V3) {
         if !self.cfg.extrinsic_est_en {
             return (self.lidar_r_wrt_imu, self.lidar_t_wrt_imu);
         }
-        let (orli, otli) = if !self.cfg.use_imu_as_input {
+        if !self.cfg.use_imu_as_input {
             let x = &self.kf_output.x;
             (x.offset_R_L_I, x.offset_T_L_I)
         } else {
             let x = &self.kf_input.x;
             (x.offset_R_L_I, x.offset_T_L_I)
-        };
-        (frob_normalized(&orli), otli)
+        }
     }
 
     /// Every point of the last scan in the world frame, moved by the state at its own time.
     /// Empty until a scan has been through the point-by-point update.
     fn deskewed_world(&self) -> impl Iterator<Item = (V3, f32)> + '_ {
         let (r, t) = self.extrinsic();
-        let beg = self.measures.lidar_beg_time;
-        let points: &[PointXYZI] = if self.scan_poses.is_empty() {
+        let points: &[PointXYZI] = if self.trajectory.is_empty() {
             &[]
         } else {
             &self.feats_undistort
         };
         points.iter().map(move |p| {
-            let (pos, rot) = pose_at(&self.scan_poses, beg + p.curvature as f64 / 1000.0);
+            let (pos, rot) = self.trajectory.pose_at(p.curvature as f64 / 1000.0);
             let w = rot * (r * V3::new(p.x as f64, p.y as f64, p.z as f64) + t) + pos;
             (w, p.intensity)
         })
@@ -887,19 +915,19 @@ impl LaserMapping {
     /// `get_body_cloud`, deskewed: the last scan in the IMU frame at the end of the scan,
     /// the pose `odometry()` reports.
     pub fn body_cloud(&self) -> Vec<PointXYZI> {
-        let Some(end) = self.scan_poses.last() else {
+        let Some(end) = self.trajectory.end() else {
             return Vec::new();
         };
         let rot_inv = end.rot.inverse();
         self.deskewed_world()
-            .map(|(w, i)| point_out(rot_inv * (w - end.pos), i))
+            .map(|(w, intensity)| to_point(rot_inv * (w - end.pos), intensity))
             .collect()
     }
 
     /// `get_world_cloud`, deskewed: the last scan in the world frame.
     pub fn world_cloud(&self) -> Vec<PointXYZI> {
         self.deskewed_world()
-            .map(|(w, i)| point_out(w, i))
+            .map(|(w, intensity)| to_point(w, intensity))
             .collect()
     }
 }
@@ -954,91 +982,212 @@ mod tests {
         assert!((f[(0, 0)] - 1.0 / 3f64.sqrt()).abs() < 1e-15);
     }
 
-    #[test]
-    fn static_scene_stays_put() {
-        // A box room seen from a fixed sensor with a resting IMU: after init the pose must
-        // stay near the origin and every frame after map init must produce odometry.
-        let cfg = Config {
-            point_filter_num: 1,
-            blind: 0.1,
-            ..Default::default()
-        };
-        let mut lm = LaserMapping::new(&cfg);
-        let mut frame = Vec::new();
-        for i in 0..1500u64 {
-            let a = i as f32 * 0.0037;
-            let b = (i % 97) as f32 * 0.03 - 1.4;
-            // Rays hitting walls at x=+-4, y=+-4, z=+-2 (a crude box).
-            let dir = [a.cos() * b.cos(), a.sin() * b.cos(), b.sin()];
-            let t = [4.0 / dir[0].abs(), 4.0 / dir[1].abs(), 2.0 / dir[2].abs()]
-                .into_iter()
-                .fold(f32::MAX, f32::min);
-            frame.push(LivoxPoint {
-                x: dir[0] * t,
-                y: dir[1] * t,
-                z: dir[2] * t,
-                reflectivity: 50,
-                tag: 0,
-                line: 0,
-                offset_time: i * 66_000,
-            });
+    /// Rays hitting walls at x = +-4, y = +-4, z = +-2, a crude box room.
+    fn box_room() -> Vec<LivoxPoint> {
+        (0..1500u64)
+            .map(|i| {
+                let a = i as f32 * 0.0037;
+                let b = (i % 97) as f32 * 0.03 - 1.4;
+                let dir = [a.cos() * b.cos(), a.sin() * b.cos(), b.sin()];
+                let t = [4.0 / dir[0].abs(), 4.0 / dir[1].abs(), 2.0 / dir[2].abs()]
+                    .into_iter()
+                    .fold(f32::MAX, f32::min);
+                LivoxPoint {
+                    x: dir[0] * t,
+                    y: dir[1] * t,
+                    z: dir[2] * t,
+                    reflectivity: 50,
+                    tag: 0,
+                    line: 0,
+                    offset_time: i * 66_000,
+                }
+            })
+            .collect()
+    }
+
+    /// Feed one resting frame of the box room at 10 Hz with its IMU samples and drain.
+    fn feed_resting_frame(lm: &mut LaserMapping, frame: &[LivoxPoint], t0: f64) -> bool {
+        for j in 0..20 {
+            lm.imu_cbk(t0 + j as f64 * 0.005, V3::zeros(), V3::new(0.0, 0.0, 1.0));
         }
+        lm.imu_cbk(t0 + 0.1, V3::zeros(), V3::new(0.0, 0.0, 1.0));
+        lm.livox_pcl_cbk(t0, frame);
+        let mut processed = false;
+        loop {
+            let before = lm.lidar_buffer.len();
+            if lm.run_once() {
+                processed = true;
+                let o = lm.odometry();
+                assert!(o.pos.iter().all(|v| v.abs() < 0.05), "{o:?}");
+                assert!((o.quat[3].abs() - 1.0).abs() < 1e-3, "{o:?}");
+            }
+            if lm.lidar_buffer.len() == before {
+                break;
+            }
+        }
+        processed
+    }
+
+    fn static_scene(cfg: Config) -> LaserMapping {
+        let mut lm = LaserMapping::new(&cfg);
+        let frame = box_room();
         let mut processed = 0;
         for f in 0..10u64 {
-            let t0 = 100.0 + f as f64 * 0.1;
-            for j in 0..20 {
-                lm.imu_cbk(t0 + j as f64 * 0.005, V3::zeros(), V3::new(0.0, 0.0, 1.0));
-            }
-            lm.imu_cbk(t0 + 0.1, V3::zeros(), V3::new(0.0, 0.0, 1.0));
-            lm.livox_pcl_cbk(t0, &frame);
-            loop {
-                let before = lm.lidar_buffer.len();
-                if lm.run_once() {
-                    processed += 1;
-                    let o = lm.odometry();
-                    assert!(o.pos.iter().all(|v| v.abs() < 0.05), "{o:?}");
-                    assert!((o.quat[3].abs() - 1.0).abs() < 1e-3, "{o:?}");
-                }
-                if lm.lidar_buffer.len() == before {
-                    break;
-                }
+            if feed_resting_frame(&mut lm, &frame, 100.0 + f as f64 * 0.1) {
+                processed += 1;
             }
         }
         assert!(processed >= 5, "processed {processed}");
+        lm
+    }
+
+    fn v3(p: &PointXYZI) -> V3 {
+        V3::new(p.x as f64, p.y as f64, p.z as f64)
+    }
+
+    fn assert_static_scene(lm: &LaserMapping) {
+        assert_eq!(lm.body_cloud().len(), lm.feats_undistort.len());
         assert_eq!(lm.body_cloud().len(), lm.world_cloud().len());
         assert!(lm.ivox.num_valid_grids() > 10);
-        // The trajectory spans the scan, and a resting sensor sees no deskew beyond the
-        // filter's own jitter.
-        let poses = &lm.scan_poses;
+        let poses = &lm.trajectory.poses;
         assert!(poses.len() > 100, "{}", poses.len());
         assert!(poses.windows(2).all(|w| w[1].t > w[0].t));
-        assert!(
-            poses[0].t < lm.lidar_end_time - 0.09 && poses.last().unwrap().t <= lm.lidar_end_time
-        );
+        assert!(poses[0].t < 0.01 && poses.last().unwrap().t > 0.09);
+        // A resting sensor sees no deskew beyond the filter's own jitter.
         let (r, t) = lm.extrinsic();
         for (raw, out) in lm.feats_undistort.iter().zip(lm.body_cloud()) {
-            let b = r * V3::new(raw.x as f64, raw.y as f64, raw.z as f64) + t;
-            let d = (V3::new(out.x as f64, out.y as f64, out.z as f64) - b).norm();
+            let d = (v3(&out) - (r * v3(raw) + t)).norm();
             assert!(d < 0.02, "{d}");
         }
     }
 
     #[test]
+    fn static_scene_stays_put() {
+        let lm = static_scene(Config {
+            point_filter_num: 1,
+            blind: 0.1,
+            ..Default::default()
+        });
+        assert_static_scene(&lm);
+    }
+
+    #[test]
+    fn static_scene_stays_put_with_imu_as_input() {
+        let lm = static_scene(Config {
+            point_filter_num: 1,
+            blind: 0.1,
+            use_imu_as_input: true,
+            ..Default::default()
+        });
+        assert_static_scene(&lm);
+    }
+
+    #[test]
+    fn world_cloud_uses_the_estimated_extrinsic_unscaled() {
+        let lm = static_scene(Config {
+            point_filter_num: 1,
+            blind: 0.1,
+            extrinsic_est_en: true,
+            extrinsic_t: vec![0.3, -0.2, 0.1],
+            ..Default::default()
+        });
+        let max_x = lm
+            .world_cloud()
+            .iter()
+            .map(|p| p.x.abs())
+            .fold(0.0f32, f32::max);
+        assert!((max_x - 4.0).abs() < 0.1, "{max_x}");
+    }
+
+    #[test]
+    fn clouds_are_empty_before_a_scan_is_processed() {
+        let mut lm = LaserMapping::new(&Config::default());
+        lm.feats_undistort.push(PointXYZI::default());
+        assert!(lm.body_cloud().is_empty() && lm.world_cloud().is_empty());
+    }
+
+    #[test]
+    fn clouds_do_not_change_when_the_next_scan_is_latched() {
+        let mut lm = static_scene(Config {
+            point_filter_num: 1,
+            blind: 0.1,
+            ..Default::default()
+        });
+        let before = lm.world_cloud();
+        // The next scan is buffered but its IMU has not arrived, so sync_packages latches
+        // it without processing.
+        lm.imu_cbk(101.005, V3::zeros(), V3::new(0.0, 0.0, 1.0));
+        lm.livox_pcl_cbk(101.0, &box_room());
+        assert!(!lm.run_once());
+        assert_eq!(lm.measures.lidar_beg_time, 101.0);
+        let after = lm.world_cloud();
+        assert_eq!(before.len(), after.len());
+        assert!(before.iter().zip(&after).all(|(a, b)| v3(a) == v3(b)));
+    }
+
+    fn sample(t: f64, yaw_deg: f64, x: f64) -> (f64, V3, M3) {
+        (
+            t,
+            V3::new(x, 0.0, 0.0),
+            crate::so3::exp(&V3::new(0.0, 0.0, yaw_deg.to_radians())),
+        )
+    }
+
+    fn trajectory_of(samples: &[(f64, V3, M3)]) -> ScanTrajectory {
+        let mut trajectory = ScanTrajectory::default();
+        let (i, z) = (M3::identity(), V3::zeros());
+        for (t, pos, rot) in samples {
+            let pose = Pose {
+                pos,
+                rot,
+                offset_R_L_I: &i,
+                offset_T_L_I: &z,
+            };
+            trajectory.push(*t, pose);
+        }
+        trajectory
+    }
+
+    #[test]
+    fn pose_at_clamps_and_interpolates() {
+        let tr = trajectory_of(&[
+            sample(0.01, 0.0, 0.0),
+            sample(0.02, 10.0, 1.0),
+            sample(0.04, 10.0, 3.0),
+        ]);
+        let yaw = |q: UnitQuaternion<f64>| q.euler_angles().2.to_degrees();
+        let (p, q) = tr.pose_at(0.0);
+        assert!(p == V3::zeros() && yaw(q).abs() < 1e-9);
+        let (p, q) = tr.pose_at(0.05);
+        assert!(p == V3::new(3.0, 0.0, 0.0) && (yaw(q) - 10.0).abs() < 1e-9);
+        let (p, q) = tr.pose_at(0.02);
+        assert!(p == V3::new(1.0, 0.0, 0.0) && (yaw(q) - 10.0).abs() < 1e-9);
+        let (p, q) = tr.pose_at(0.015);
+        assert!((p - V3::new(0.5, 0.0, 0.0)).norm() < 1e-12 && (yaw(q) - 5.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn interpolation_takes_the_short_arc_across_a_quaternion_sign_flip() {
+        // Rotation matrices either side of yaw -120 deg convert to quaternions of opposite sign.
+        let tr = trajectory_of(&[sample(0.0, -119.98, 0.0), sample(0.0005, -120.02, 0.0)]);
+        assert!(tr.poses[0].rot.coords.dot(&tr.poses[1].rot.coords) > 0.99);
+        let (_, mid) = tr.pose_at(0.00025);
+        let err = mid.angle_to(&trajectory_of(&[sample(0.0, -120.0, 0.0)]).poses[0].rot);
+        assert!(err.to_degrees() < 1e-6, "{err}");
+    }
+
+    #[test]
     fn deskew_moves_each_point_by_the_pose_at_its_time() {
-        // A wall at world x = 5 scanned over 100 ms while the sensor yaws at 1.4 rad/s and
-        // walks at 1 m/s. Raw points are what the lidar saw at each point's time, so the
-        // deskewed body cloud must be the wall seen from the scan-end pose, coplanar, and the
-        // world cloud must lie on the wall itself.
+        // Raw points are what the lidar saw at each point's own time from a sensor yawing
+        // at 1.4 rad/s and walking at 1 m/s. Deskewed, they must land on the wall at x = 5.
         let cfg = Config {
             extrinsic_t: vec![0.1, 0.02, -0.05],
             extrinsic_r: vec![0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0],
             ..Default::default()
         };
         let mut lm = LaserMapping::new(&cfg);
-        let beg = 100.0;
-        lm.measures.lidar_beg_time = beg;
-        let pose_at_time = |t: f64| {
-            let dt = t - beg;
+        let tol = 1e-3;
+        let pose_at_time = |dt: f64| {
             (
                 V3::new(dt, 0.3 * dt, 0.0),
                 crate::so3::exp(&V3::new(0.0, 0.0, 1.4 * dt)),
@@ -1046,24 +1195,22 @@ mod tests {
         };
         // Samples every 0.5 ms, as the downsampled groups would give.
         for i in 0..=200 {
-            let t = beg + i as f64 * 0.0005;
-            let (pos, rot) = pose_at_time(t);
+            let dt = i as f64 * 0.0005;
+            let (pos, rot) = pose_at_time(dt);
             let pose = Pose {
                 pos: &pos,
                 rot: &rot,
                 offset_R_L_I: &lm.lidar_r_wrt_imu,
                 offset_T_L_I: &lm.lidar_t_wrt_imu,
             };
-            lm.scan_poses.push(ScanPose::new(t, pose));
+            lm.trajectory.push(dt, pose);
         }
-        lm.lidar_end_time = beg + 0.1;
         let mut wall = Vec::new();
         for i in 0..2000 {
             // Point times fall between samples, so interpolation is exercised.
             let offset_ms = i as f64 * 0.05 + 0.00013;
-            let t = beg + offset_ms / 1000.0;
             let w = V3::new(5.0, (i % 50) as f64 * 0.1 - 2.5, (i % 7) as f64 * 0.3 - 0.9);
-            let (pos, rot) = pose_at_time(t);
+            let (pos, rot) = pose_at_time(offset_ms / 1000.0);
             let b = rot.transpose() * (w - pos);
             let l = lm.lidar_r_wrt_imu.transpose() * (b - lm.lidar_t_wrt_imu);
             wall.push(w);
@@ -1078,32 +1225,29 @@ mod tests {
         let world = lm.world_cloud();
         assert_eq!(world.len(), wall.len());
         for (p, w) in world.iter().zip(&wall) {
-            let d = (V3::new(p.x as f64, p.y as f64, p.z as f64) - w).norm();
-            assert!(d < 1e-3, "{d}");
+            let d = (v3(p) - w).norm();
+            assert!(d < tol, "{d}");
         }
-        let end = lm.scan_poses.last().unwrap();
+        let end = lm.trajectory.end().unwrap();
         let body = lm.body_cloud();
+        assert_eq!(body.len(), wall.len());
         for (p, w) in body.iter().zip(&wall) {
-            let expect = end.rot.inverse() * (w - end.pos);
-            let d = (V3::new(p.x as f64, p.y as f64, p.z as f64) - expect).norm();
-            assert!(d < 1e-3, "{d}");
+            let d = (v3(p) - end.rot.inverse() * (w - end.pos)).norm();
+            assert!(d < tol, "{d}");
         }
         // Coplanar in the end frame: the wall normal is world x rotated into that frame.
         let n = end.rot.inverse() * V3::x();
         let offset = n.dot(&(end.rot.inverse() * (V3::new(5.0, 0.0, 0.0) - end.pos)));
         for p in &body {
-            let d = n.dot(&V3::new(p.x as f64, p.y as f64, p.z as f64)) - offset;
-            assert!(d.abs() < 1e-3, "{d}");
+            let d = n.dot(&v3(p)) - offset;
+            assert!(d.abs() < tol, "{d}");
         }
         // Without deskew the same raw scan is far off the wall.
         let (r, t) = lm.extrinsic();
         let worst = lm
             .feats_undistort
             .iter()
-            .map(|p| {
-                let b = r * V3::new(p.x as f64, p.y as f64, p.z as f64) + t;
-                (n.dot(&b) - offset).abs()
-            })
+            .map(|p| (n.dot(&(r * v3(p) + t)) - offset).abs())
             .fold(0.0, f64::max);
         assert!(worst > 0.3, "{worst}");
     }
